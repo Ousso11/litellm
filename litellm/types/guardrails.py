@@ -71,6 +71,7 @@ class SupportedGuardrailIntegrations(Enum):
     CROWDSTRIKE_AIDR = "crowdstrike_aidr"
     LASSO = "lasso"
     PILLAR = "pillar"
+    COMPRESR = "compresr"
     GRAYSWAN = "grayswan"
     PANW_PRISMA_AIRS = "panw_prisma_airs"
     AZURE_PROMPT_SHIELD = "azure/prompt_shield"
@@ -473,6 +474,52 @@ class PillarGuardrailConfigModel(BaseModel):
     )
 
 
+class CompresrGuardrailConfigModel(BaseModel):
+    """YAML schema for the Compresr context-compression guardrail.
+
+    Flat field set declared so operators can write `litellm_params.compress_*`
+    in config.yaml. The real model + behaviour live in the Compresr SDK at
+    `compresr.integrations.litellm.types.CompresrGuardrailConfigModel`.
+    """
+
+    compression_model_name: Optional[str] = Field(
+        default="latte_v1",
+        description="Compresr compression model. Defaults to 'latte_v1'.",
+    )
+    target_compression_ratio: Optional[float] = Field(
+        default=0.5,
+        description="0-1 = fraction of tokens to remove; >1 = Nx factor.",
+    )
+    coarse: Optional[bool] = Field(
+        default=None,
+        description="Paragraph-level compression. None uses backend default.",
+    )
+    min_chars_to_compress: Optional[int] = Field(
+        default=500,
+        description="Skip compressing messages shorter than this many characters.",
+    )
+    compress_tool_outputs: Optional[bool] = Field(
+        default=True,
+        description="Compress tool/function result messages. ON by default.",
+    )
+    compress_system: Optional[bool] = Field(
+        default=False,
+        description="Compress system messages. OFF by default.",
+    )
+    compress_history: Optional[bool] = Field(
+        default=False,
+        description="Compress prior (non-last) user messages. OFF by default.",
+    )
+    compress_last_user: Optional[bool] = Field(
+        default=False,
+        description="Replace the last user message content with its compressed form.",
+    )
+    fail_closed: Optional[bool] = Field(
+        default=False,
+        description="If True, fail the request when Compresr is unavailable.",
+    )
+
+
 class NomaGuardrailConfigModel(BaseModel):
     """Configuration parameters for the Noma Security guardrail"""
 
@@ -775,6 +822,7 @@ class LitellmParams(
     LakeraV2GuardrailConfigModel,
     LassoGuardrailConfigModel,
     PillarGuardrailConfigModel,
+    CompresrGuardrailConfigModel,
     GraySwanGuardrailConfigModel,
     NomaGuardrailConfigModel,
     PromptGuardConfigModel,
