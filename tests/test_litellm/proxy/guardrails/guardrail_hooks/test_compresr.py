@@ -16,6 +16,7 @@ Tests cover:
 
 import hashlib
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -142,6 +143,10 @@ def _apply_inputs(messages: list) -> GenericGuardrailAPIInputs:
     return GenericGuardrailAPIInputs(structured_messages=[dict(m) for m in messages])
 
 
+def _logging_obj(call_id: str) -> SimpleNamespace:
+    return SimpleNamespace(litellm_call_id=call_id)
+
+
 @pytest.fixture
 def guardrail() -> CompresrGuardrail:
     return _make_guardrail()
@@ -189,8 +194,9 @@ async def test_apply_guardrail_compresses_tool_output_with_intent_query(
     with patch.object(guardrail.async_handler, "post", mock_post):
         result = await guardrail.apply_guardrail(
             inputs=inputs,
-            request_data={"model": "gpt-4o", "litellm_call_id": "call-id-1"},
+            request_data={"model": "gpt-4o"},
             input_type="request",
+            logging_obj=_logging_obj("call-id-1"),
         )
 
     _, call_kwargs = mock_post.call_args
@@ -358,7 +364,8 @@ async def test_multimodal_text_replaced_non_text_preserved(
 
 
 @pytest.mark.asyncio
-async def test_bypass_header_skips_compression(guardrail: CompresrGuardrail):
+async def test_bypass_header_skips_compression_when_allowed():
+    guardrail = _make_guardrail(allow_bypass_header=True)
     inputs = _apply_inputs(AGENT_MESSAGES)
     mock_post = AsyncMock()
     request_data = {
@@ -371,6 +378,21 @@ async def test_bypass_header_skips_compression(guardrail: CompresrGuardrail):
 
     mock_post.assert_not_called()
     assert result is inputs
+
+
+@pytest.mark.asyncio
+async def test_bypass_header_ignored_by_default(guardrail: CompresrGuardrail):
+    inputs = _apply_inputs(AGENT_MESSAGES)
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    request_data = {
+        "model": "gpt-4o",
+        "proxy_server_request": {"headers": {"x-compresr-bypass": "true"}},
+    }
+
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(inputs=inputs, request_data=request_data, input_type="request")
+
+    mock_post.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -443,6 +465,90 @@ async def test_non_json_response_raises_when_fail_closed(guardrail: CompresrGuar
 
 
 @pytest.mark.asyncio
+async def test_http_exception_does_not_reflect_upstream_body(guardrail: CompresrGuardrail):
+    mock = MagicMock()
+    mock.status_code = 500
+    mock.json.side_effect = ValueError("not json")
+    mock.text = "SECRET_INSTANCE_METADATA_TOKEN=aws-imds-response"
+
+    with patch.object(guardrail.async_handler, "post", AsyncMock(return_value=mock)):
+        with pytest.raises(HTTPException) as exc_info:
+            await guardrail.apply_guardrail(
+                inputs=_apply_inputs(AGENT_MESSAGES),
+                request_data={"model": "gpt-4o"},
+                input_type="request",
+            )
+    assert "SECRET_INSTANCE_METADATA_TOKEN" not in json.dumps(exc_info.value.detail)
+
+
+def test_init_rejects_non_http_api_base():
+    with pytest.raises(ValueError, match="scheme"):
+        CompresrGuardrail(
+            api_base="file:///etc/passwd",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+def test_init_rejects_cloud_metadata_api_base():
+    with pytest.raises(ValueError, match="metadata"):
+        CompresrGuardrail(
+            api_base="http://169.254.169.254",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_ignores_user_supplied_call_id(guardrail: CompresrGuardrail):
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    attacker_call_id = "victim-tenant-call-id"
+
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(AGENT_MESSAGES),
+            request_data={"model": "gpt-4o", "litellm_call_id": attacker_call_id},
+            input_type="request",
+            logging_obj=_logging_obj("real-framework-call-id"),
+        )
+
+    assert attacker_call_id not in guardrail._originals_by_call_id
+    assert "real-framework-call-id" in guardrail._originals_by_call_id
+
+
+@pytest.mark.asyncio
+async def test_agentic_plan_ignores_user_supplied_call_id(guardrail: CompresrGuardrail):
+    hash_value = "d" * 24
+    guardrail._store_originals("victim-tenant-call-id", {hash_value: "victim-original"})
+
+    plan = await guardrail.async_build_agentic_loop_plan(
+        tools={
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "name": COMPRESR_RETRIEVE_TOOL_NAME,
+                    "arguments": {"hash": hash_value},
+                }
+            ]
+        },
+        model="gpt-4o",
+        messages=[],
+        response=_make_openai_response_with_tool_call(
+            COMPRESR_RETRIEVE_TOOL_NAME, {"hash": hash_value}, tool_id="call_abc"
+        ),
+        anthropic_messages_provider_config=None,
+        anthropic_messages_optional_request_params={},
+        logging_obj=_logging_obj("attacker-call-id"),
+        stream=False,
+        kwargs={"litellm_call_id": "victim-tenant-call-id"},
+    )
+
+    assert "victim-original" not in plan.request_patch.messages[-1]["content"]
+    assert "not found" in plan.request_patch.messages[-1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_batch_result_count_mismatch_raises_when_fail_closed():
     guardrail = _make_guardrail(compress_system=True)
     messages = [
@@ -470,10 +576,14 @@ async def test_recovery_marker_tool_injection_and_original_stored(
 ):
     inputs = _apply_inputs(AGENT_MESSAGES)
     mock_post = AsyncMock(return_value=_make_single_compress_response())
-    request_data = {"model": "gpt-4o", "litellm_call_id": "call-id-1"}
 
     with patch.object(guardrail.async_handler, "post", mock_post):
-        result = await guardrail.apply_guardrail(inputs=inputs, request_data=request_data, input_type="request")
+        result = await guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+            logging_obj=_logging_obj("call-id-1"),
+        )
 
     compressed_content = result["structured_messages"][3]["content"]
     expected_hash = hashlib.sha256(TOOL_OUTPUT.encode()).hexdigest()[:24]
@@ -517,8 +627,9 @@ async def test_existing_tools_preserved_when_injecting(guardrail: CompresrGuardr
     with patch.object(guardrail.async_handler, "post", mock_post):
         result = await guardrail.apply_guardrail(
             inputs=inputs,
-            request_data={"model": "gpt-4o", "litellm_call_id": "call-id-1"},
+            request_data={"model": "gpt-4o"},
             input_type="request",
+            logging_obj=_logging_obj("call-id-1"),
         )
 
     tools = result["tools"]
@@ -597,9 +708,9 @@ async def test_agentic_plan_returns_stored_original(guardrail: CompresrGuardrail
         ),
         anthropic_messages_provider_config=None,
         anthropic_messages_optional_request_params={},
-        logging_obj=None,
+        logging_obj=_logging_obj("call-id-1"),
         stream=False,
-        kwargs={"litellm_call_id": "call-id-1"},
+        kwargs={},
     )
 
     assert plan.run_agentic_loop is True
@@ -635,9 +746,9 @@ async def test_agentic_plan_rejects_hash_from_other_request(
         ),
         anthropic_messages_provider_config=None,
         anthropic_messages_optional_request_params={},
-        logging_obj=None,
+        logging_obj=_logging_obj("my-call"),
         stream=False,
-        kwargs={"litellm_call_id": "my-call"},
+        kwargs={},
     )
 
     content = plan.request_patch.messages[-1]["content"]
@@ -672,9 +783,9 @@ async def test_agentic_plan_builds_anthropic_followup_shape(
         response=response,
         anthropic_messages_provider_config=None,
         anthropic_messages_optional_request_params={"max_tokens": 1024},
-        logging_obj=None,
+        logging_obj=_logging_obj("call-id-1"),
         stream=False,
-        kwargs={"litellm_call_id": "call-id-1"},
+        kwargs={},
     )
 
     follow_up = plan.request_patch.messages
@@ -703,3 +814,16 @@ def test_originals_store_caps_tracked_calls(guardrail: CompresrGuardrail):
     assert len(guardrail._originals_by_call_id) <= 256
     # Most recent entries survive.
     assert "call-299" in guardrail._originals_by_call_id
+
+
+def test_originals_store_caps_bytes_per_call():
+    guardrail = _make_guardrail(max_bytes_per_call=1000)
+    hashes = tuple(f"{i:024x}" for i in range(5))
+    values = tuple("x" * 400 for _ in range(5))
+    guardrail._store_originals("c", dict(zip(hashes, values)))
+
+    stored, _expiry = guardrail._originals_by_call_id["c"]
+    assert sum(len(v.encode("utf-8")) for v in stored.values()) <= 1000
+    # Oldest entries are evicted first; newest survives.
+    assert hashes[-1] in stored
+    assert hashes[0] not in stored

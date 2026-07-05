@@ -51,6 +51,22 @@ class CompresrGuardrailOptionalParams(BaseModel):
             "marker via the agentic loop. Defaults to True."
         ),
     )
+    max_bytes_per_call: Optional[int] = Field(
+        default=None,
+        description=(
+            "Cap on aggregate bytes of stored originals per litellm_call_id. "
+            "When a call exceeds this, oldest entries are evicted so the "
+            "in-process store cannot grow without bound. Defaults to 10 MiB."
+        ),
+    )
+    allow_bypass_header: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Honor the `x-compresr-bypass: true` request header to skip "
+            "compression for a single call. Off by default because the "
+            "header is caller-settable; enable only on trusted deployments."
+        ),
+    )
 
 
 class CompresrGuardrailConfigModel(GuardrailConfigModel[CompresrGuardrailOptionalParams]):
