@@ -16,11 +16,14 @@ via ``tool_call_id``), falling back to the last user message.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import re
+import socket
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Literal, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import HTTPException
@@ -67,7 +70,47 @@ DEFAULT_MIN_CHARS_TO_COMPRESS = 500
 _HASH_PATTERN = re.compile(r"compresr hash=([a-f0-9]{24})")
 _ORIGINALS_TTL_SECONDS = 15 * 60
 _MAX_TRACKED_CALLS = 256
+_DEFAULT_MAX_BYTES_PER_CALL = 10 * 1024 * 1024
 _SOURCE_TAG = "gateway:unknown"
+_BLOCKED_METADATA_HOSTS = frozenset(
+    {
+        "169.254.169.254",
+        "fd00:ec2::254",
+        "100.100.100.200",
+        "metadata.google.internal",
+        "metadata.goog",
+    }
+)
+
+
+def _validate_api_base(url: str) -> str:
+    """Return ``url`` if it is a safe outbound target, else raise ``ValueError``.
+
+    Blocks non-http(s) schemes and the well-known cloud-metadata IPs so that
+    an attacker with config-write access cannot turn the guardrail into an
+    SSRF probe against instance metadata. Private-range hosts are allowed
+    because on-prem Compresr deployments legitimately live there.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Compresr guardrail api_base must be http or https, got scheme={parsed.scheme!r}"
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Compresr guardrail api_base has no host")
+    if host in _BLOCKED_METADATA_HOSTS:
+        raise ValueError(f"Compresr guardrail api_base {host!r} is a blocked cloud-metadata host")
+    try:
+        for info in socket.getaddrinfo(host, None):
+            addr = info[4][0]
+            if addr in _BLOCKED_METADATA_HOSTS or ipaddress.ip_address(addr).is_link_local:
+                raise ValueError(
+                    f"Compresr guardrail api_base {host!r} resolves to blocked address {addr!r}"
+                )
+    except socket.gaierror:
+        pass
+    return url
 
 
 def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
@@ -228,15 +271,14 @@ def _extract_compresr_tool_calls(response: object) -> list[dict[str, object]]:
     ]
 
 
-def _resolve_call_id(logging_obj: object, request_state: dict[str, object]) -> Optional[str]:
-    """Resolve the litellm_call_id shared by a request's guardrail hook and its
-    agentic-loop hooks, so retrieval is scoped per call instead of honoring any
-    hash-shaped string that shows up in message text."""
+def _resolve_call_id(logging_obj: object) -> Optional[str]:
+    """Framework-issued call id only; user-supplied ids from the request body
+    are ignored so one tenant cannot retrieve another tenant's originals by
+    guessing or observing a call id."""
     logging_call_id = getattr(logging_obj, "litellm_call_id", None)
     if isinstance(logging_call_id, str) and logging_call_id:
         return logging_call_id
-    kwargs_call_id = request_state.get("litellm_call_id")
-    return kwargs_call_id if isinstance(kwargs_call_id, str) else None
+    return None
 
 
 def _is_responses_api_response(response: object) -> bool:
@@ -338,8 +380,11 @@ class CompresrGuardrail(CustomGuardrail):
         event_hook: GuardrailEventHooks | list[GuardrailEventHooks] | Mode | None = None,
         default_on: bool = False,
         unreachable_fallback: str | None = None,
+        max_bytes_per_call: int | None = None,
+        allow_bypass_header: bool | None = None,
     ):
-        self.compresr_api_base = (api_base or get_secret_str("COMPRESR_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+        raw_api_base = (api_base or get_secret_str("COMPRESR_API_BASE") or DEFAULT_API_BASE).rstrip("/")
+        self.compresr_api_base = _validate_api_base(raw_api_base)
         self.compresr_api_key = api_key or get_secret_str("COMPRESR_API_KEY")
         if not self.compresr_api_key:
             raise ValueError(
@@ -362,6 +407,10 @@ class CompresrGuardrail(CustomGuardrail):
         self.unreachable_fallback: Literal["fail_closed", "fail_open"] = (
             "fail_open" if unreachable_fallback == "fail_open" else "fail_closed"
         )
+        self.max_bytes_per_call = (
+            _DEFAULT_MAX_BYTES_PER_CALL if max_bytes_per_call is None else max_bytes_per_call
+        )
+        self.allow_bypass_header = False if allow_bypass_header is None else allow_bypass_header
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
@@ -375,6 +424,8 @@ class CompresrGuardrail(CustomGuardrail):
     # ── request plumbing ──────────────────────────────────────────────
 
     def _should_bypass(self, request_data: dict) -> bool:
+        if not self.allow_bypass_header:
+            return False
         psr = request_data.get("proxy_server_request")
         if not _is_str_object_dict(psr):
             return False
@@ -389,17 +440,21 @@ class CompresrGuardrail(CustomGuardrail):
             "X-API-Key": self.compresr_api_key or "",
         }
 
-    def _handle_compress_failure(self, error: str, detail: dict[str, object]) -> None:
+    def _handle_compress_failure(self, error: str, log_detail: dict[str, object]) -> None:
         """fail_open logs and returns (caller forwards uncompressed);
-        fail_closed raises."""
+        fail_closed raises. ``log_detail`` may include upstream response bodies
+        and is written only to server logs; the raised ``HTTPException`` carries
+        a generic message so a malicious ``api_base`` cannot exfiltrate response
+        bytes through the client-visible error."""
         if self.unreachable_fallback == "fail_open":
             verbose_proxy_logger.critical(
                 "Compresr: %s; fail_open configured, forwarding request uncompressed. detail=%s",
                 error,
-                detail,
+                log_detail,
             )
             return
-        raise HTTPException(status_code=502, detail={"error": error, **detail})
+        verbose_proxy_logger.error("Compresr: %s. detail=%s", error, log_detail)
+        raise HTTPException(status_code=502, detail={"error": error})
 
     # ── originals store (recovery) ────────────────────────────────────
 
@@ -419,13 +474,34 @@ class CompresrGuardrail(CustomGuardrail):
 
     def _store_originals(self, call_id: str, originals: dict[str, str]) -> None:
         existing, _ = self._originals_by_call_id.get(call_id, ({}, 0.0))
+        merged = self._bound_call_bytes({**existing, **originals})
         self._originals_by_call_id[call_id] = (
-            {**existing, **originals},
+            merged,
             time.monotonic() + _ORIGINALS_TTL_SECONDS,
         )
         # Prune after inserting so the cap holds; the entry just added has the
         # latest expiry and always survives eviction.
         self._prune_originals()
+
+    def _bound_call_bytes(self, merged: dict[str, str]) -> dict[str, str]:
+        """Drop oldest entries (dict insertion order) until the aggregate byte
+        size fits ``self.max_bytes_per_call``. Prevents one call with many
+        large tool outputs from growing proxy memory without bound."""
+        if self.max_bytes_per_call <= 0:
+            return merged
+        total = sum(len(value.encode("utf-8")) for value in merged.values())
+        if total <= self.max_bytes_per_call:
+            return merged
+        bounded = dict(merged)
+        for key in list(bounded.keys()):
+            if total <= self.max_bytes_per_call:
+                break
+            total -= len(bounded[key].encode("utf-8"))
+            del bounded[key]
+            verbose_proxy_logger.warning(
+                "Compresr: originals-store byte cap hit, evicted hash=%s", key
+            )
+        return bounded
 
     def _retrieve_original(self, call_id: Optional[str], hash_value: str) -> str:
         if call_id:
@@ -476,12 +552,6 @@ class CompresrGuardrail(CustomGuardrail):
                 json=payload,
                 headers=self._request_headers(),
             )
-        except httpx.HTTPStatusError as e:
-            self._handle_compress_failure(
-                "Compresr compression service returned an error",
-                {"status_code": e.response.status_code, "body": e.response.text},
-            )
-            return None
         except (httpx.ConnectError, httpx.TimeoutException, httpx.TransportError, litellm.Timeout) as e:
             self._handle_compress_failure(
                 "Compresr compression service unreachable",
@@ -658,10 +728,7 @@ class CompresrGuardrail(CustomGuardrail):
         if not self.enable_retrieval or not originals:
             return {**inputs, "structured_messages": compressed_messages}  # pyright: ignore[reportReturnType]  # plain dicts satisfy AllMessageValues at runtime
 
-        call_id = _resolve_call_id(logging_obj, request_data)
-        if not call_id:
-            call_id = str(uuid.uuid4())
-            request_data["litellm_call_id"] = call_id
+        call_id = _resolve_call_id(logging_obj) or str(uuid.uuid4())
         self._store_originals(call_id, originals)
 
         existing_tools = inputs.get("tools")
@@ -712,7 +779,7 @@ class CompresrGuardrail(CustomGuardrail):
     ) -> AgenticLoopPlan:
         tool_calls: list[dict[str, object]] = tools.get("tool_calls", [])  # pyright: ignore[reportAssignmentType]  # gate hook builds this dict with list values only
 
-        call_id = _resolve_call_id(logging_obj, kwargs)
+        call_id = _resolve_call_id(logging_obj)
         retrieved: list[tuple[dict[str, object], str]] = []
         for tc in tool_calls:
             arguments = tc.get("arguments", {})

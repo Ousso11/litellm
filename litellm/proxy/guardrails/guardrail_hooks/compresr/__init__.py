@@ -49,6 +49,8 @@ def initialize_guardrail(litellm_params: LitellmParams, guardrail: Guardrail) ->
         compress_history=_get_optional_value(litellm_params, optional_params, "compress_history"),
         compress_last_user=_get_optional_value(litellm_params, optional_params, "compress_last_user"),
         enable_retrieval=_get_optional_value(litellm_params, optional_params, "enable_retrieval"),
+        max_bytes_per_call=_get_optional_value(litellm_params, optional_params, "max_bytes_per_call"),
+        allow_bypass_header=_get_optional_value(litellm_params, optional_params, "allow_bypass_header"),
         guardrail_name=guardrail["guardrail_name"],
         event_hook=_coerce_event_hook(litellm_params.mode),
         default_on=litellm_params.default_on or False,
