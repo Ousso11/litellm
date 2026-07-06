@@ -827,3 +827,91 @@ def test_originals_store_caps_bytes_per_call():
     # Oldest entries are evicted first; newest survives.
     assert hashes[-1] in stored
     assert hashes[0] not in stored
+
+
+# ── dynamic (adaptive) compression — latte_v2 Kneedle ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_dynamic_flag_in_payload():
+    """dynamic=True must appear in the compress payload; unset bounds omitted."""
+    guardrail = _make_guardrail(dynamic=True)
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["dynamic"] is True
+    assert "dynamic_min_ratio" not in payload
+    assert "dynamic_max_ratio" not in payload
+
+
+@pytest.mark.asyncio
+async def test_dynamic_bounds_in_payload_when_set():
+    guardrail = _make_guardrail(dynamic=True, dynamic_min_ratio=2.0, dynamic_max_ratio=8.0)
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["dynamic"] is True
+    assert payload["dynamic_min_ratio"] == 2.0
+    assert payload["dynamic_max_ratio"] == 8.0
+
+
+@pytest.mark.asyncio
+async def test_dynamic_off_by_default():
+    guardrail = _make_guardrail()  # dynamic defaults off
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    assert mock_post.call_args.kwargs["json"]["dynamic"] is False
+
+
+# ── generic passthrough compression params ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compression_params_passthrough_in_payload():
+    """Extra params in compression_params are forwarded verbatim; named fields
+    still win on collision."""
+    guardrail = _make_guardrail(
+        compression_params={"heuristic_chunking": True, "coarse": False}
+    )
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["heuristic_chunking"] is True
+    # named `coarse` (default True) wins over the passthrough's coarse=False
+    assert payload["coarse"] is True
