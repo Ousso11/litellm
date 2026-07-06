@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -86,6 +86,14 @@ class CompresrGuardrailConfigModel(GuardrailConfigModel[CompresrGuardrailOptiona
         default=None,
         description=(
             "Compresr compression model (not the LLM). Defaults to 'latte_v2', the query-aware compression model."
+        ),
+    )
+    unreachable_fallback: Optional[Literal["fail_open", "fail_closed"]] = Field(
+        default=None,
+        description=(
+            "What to do when the Compresr service is unreachable. "
+            "'fail_closed' (default) returns HTTP 502 to the caller. "
+            "'fail_open' logs a critical warning and forwards the request uncompressed."
         ),
     )
 
