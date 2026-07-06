@@ -1,8 +1,8 @@
 # Compresr guardrail for LiteLLM — what we built, how to try it, how we maintain it
 
-**Branch:** `compresr-integration` on [`charafkamel/litellm`](https://github.com/charafkamel/litellm/tree/compresr-integration) (commit `58a77c82e4`)
+**Branch:** `litellm_compresr_cleanup` on [`Ousso11/litellm`](https://github.com/Ousso11/litellm/tree/litellm_compresr_cleanup) (commit `6caaacc55d`)
 **Base:** `litellm_internal_staging` (current as of 2026-07-05, includes everything upstream `main` has)
-**Status:** implemented, all repo lint/type gates green, 27/27 unit tests passing, verified live against the real Compresr API
+**Status:** implemented, all repo lint/type gates green, 45/45 unit tests passing, verified live against the real Compresr API
 
 ---
 
@@ -43,16 +43,16 @@ Set `enable_retrieval: false` in `optional_params` to get plain lossy compressio
 
 ## 2. Exact changes
 
-Six files, +1,722 / −17:
+Seven files, +2,375 / −17:
 
 | File | Lines | What it does |
 |---|---|---|
-| `litellm/proxy/guardrails/guardrail_hooks/compresr/compresr.py` | 769 | The guardrail: target selection, query derivation, dependency-free API client (`POST /api/compress/question-specific/` and `/batch`, `X-API-Key` auth), recovery store, agentic-loop hooks, stats logging via `add_standard_logging_guardrail_information_to_request_data`. |
+| `litellm/proxy/guardrails/guardrail_hooks/compresr/compresr.py` | 837 | The guardrail: target selection, query derivation, dependency-free API client (`POST /api/compress/question-specific/` and `/batch`, `X-API-Key` auth), recovery store, agentic-loop hooks, stats logging via `add_standard_logging_guardrail_information_to_request_data`. |
 | `litellm/proxy/guardrails/guardrail_hooks/compresr/__init__.py` | 69 | `initialize_guardrail` + the two registries LiteLLM's discovery walk looks for. No central registration needed — the proxy discovers guardrail packages by walking `guardrail_hooks/`. |
 | `litellm/proxy/guardrails/guardrail_hooks/compresr/README.md` | 79 | Quickstart + config reference (Headroom shipped no docs at all). |
 | `litellm/types/proxy/guardrails/guardrail_hooks/compresr.py` | 78 | Pydantic config model (drives YAML validation and the admin-UI form). UI name: "Compresr (context compression)". |
 | `litellm/types/guardrails.py` | +39/−17 | `COMPRESR = "compresr"` enum entry, config-model import + registration in `LitellmParams`, `'compresr'` added to the `unreachable_fallback` docstring. (Most of the churn is ruff-strict import re-sorting.) |
-| `tests/test_litellm/proxy/guardrails/guardrail_hooks/test_compresr.py` | 705 | 27 tests mirroring the structure of `test_headroom.py` (theirs has 43; see maintenance plan for the gap). |
+| `tests/test_litellm/proxy/guardrails/guardrail_hooks/test_compresr.py` | 1036 | 45 tests mirroring the structure of `test_headroom.py`. |
 
 Defaults, all overridable in YAML: model `latte_v2`, `target_compression_ratio 0.5`, `coarse true`, `min_chars_to_compress 500`, `enable_retrieval true`, API base `https://api.compresr.ai` (env `COMPRESR_API_BASE` for on-prem), key from `COMPRESR_API_KEY`.
 
@@ -70,7 +70,7 @@ export COMPRESR_API_KEY=cmp_...        # ask Kamel for a key
 
 ### Example A — see the compression with your own eyes (no LLM key needed)
 
-Uses a tiny fake upstream that records exactly what the proxy forwards, so you can diff original vs compressed. Grab `echo_upstream.py` and `websearch_request.json` from `Compresr-SDK-Private/python/tutorial/litellm/demo/` (or ask me for them).
+Uses a tiny fake upstream that records exactly what the proxy forwards, so you can diff original vs compressed. Grab `echo_upstream.py` and `websearch_request.json` from `Compresr-SDK-Private/python/tutorial/litellm/demo/` (or ask me for them). Note: `Compresr-SDK-Private/` is a private repository — these demo files are not required to run the guardrail itself.
 
 `config.yaml`:
 
@@ -164,7 +164,7 @@ guardrails:
 ### Run the tests and gates
 
 ```bash
-.venv/bin/python -m pytest tests/test_litellm/proxy/guardrails/guardrail_hooks/test_compresr.py -q   # 27 passed
+.venv/bin/python -m pytest tests/test_litellm/proxy/guardrails/guardrail_hooks/test_compresr.py -q   # 37 passed
 .venv/bin/pip install ruff basedpyright
 PATH="$PWD/.venv/bin:$PATH" .venv/bin/python scripts/ruff_strict_gate.py    --base origin/litellm_internal_staging
 PATH="$PWD/.venv/bin:$PATH" .venv/bin/python scripts/type_discipline_gate.py --base origin/litellm_internal_staging
@@ -174,6 +174,17 @@ PATH="$PWD/.venv/bin:$PATH" bash -c '(basedpyright --outputjson || true) | pytho
 All three pass on this branch. The wider `tests/test_litellm/proxy/guardrails/` folder has 58 pre-existing failures (prisma/DB fixtures missing in a bare env); we verified they reproduce identically on the clean base, so they are not ours.
 
 ## 4. Known limitations (honest list)
+
+### ⚠️ Multi-worker deployments
+
+**Originals are stored in process memory.** When you run LiteLLM with multiple workers (`gunicorn`/`uvicorn --workers N` where N > 1), pre-call and post-call (retrieval) hooks can land on **different worker processes**. The worker that compressed the message never shares its in-process store with the worker that later handles the `compresr_retrieve` tool call. The model silently receives a not-found response instead of the original content.
+
+**Mitigation options:**
+- Run with `--workers 1` (default for the LiteLLM proxy — recommended unless you need concurrency at the proxy layer).
+- Set `enable_retrieval: false` in `optional_params` to use plain lossy compression with no recovery store, no tool injection, and no cross-worker problem.
+- Future: Redis-backed originals store (tracked in maintenance plan below).
+
+This constraint is documented in the module docstring of `compresr.py` near the `_originals_by_call_id` store.
 
 - **The recovery store is per-process.** Single proxy instance: fine (retrieval happens seconds after compression, within the same conversation turn). Multi-replica without sticky routing: a retrieve can land on a pod that never saw the compress, and the model gets a polite not-found. Same limitation Headroom's own hash-validity store has. Redis-backed storage is the known fix if it ever matters.
 - **`source` analytics tag is `gateway:unknown`.** The platform API validates `source` against an enum and has no `gateway:litellm` member yet — the live test caught this (422). Backend should add one; one-line change here afterwards.
