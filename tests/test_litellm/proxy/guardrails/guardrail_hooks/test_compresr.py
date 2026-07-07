@@ -1121,3 +1121,132 @@ def test_initialize_guardrail_wires_optional_params():
     assert g.dynamic_min_ratio == 1.5
     assert g.dynamic_max_ratio == 8.0
     assert g.compression_params == {"heuristic_chunking": True}
+
+
+# ── target selection: opt-in flags ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compress_last_user_compresses_last_user_message():
+    guardrail = _make_guardrail(compress_last_user=True)
+    long_user = "This is a long user message. " * 30
+    messages = [
+        {"role": "user", "content": long_user},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response(compressed_context="short user"))
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    mock_post.assert_called_once()
+    assert result["structured_messages"][0]["content"].startswith("short user")
+
+
+@pytest.mark.asyncio
+async def test_compress_history_compresses_prior_user_messages():
+    guardrail = _make_guardrail(compress_history=True)
+    long_old_user = "Old context. " * 50
+    messages = [
+        {"role": "user", "content": long_old_user},
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_batch_compress_response(["short old", "short tool"]))
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    out = result["structured_messages"]
+    assert out[0]["content"].startswith("short old")
+    assert out[1]["content"] == USER_QUESTION
+    assert out[2]["content"].startswith("short tool")
+
+
+# ── legacy function_call query resolution ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_legacy_function_call_intent_used_as_query(guardrail: CompresrGuardrail):
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {
+            "role": "assistant",
+            "function_call": {"name": "web_search", "arguments": '{"query": "EV range 2026"}'},
+        },
+        {"role": "function", "name": "web_search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["query"] == 'web_search: {"query": "EV range 2026"}'
+
+
+# ── SSRF: CGNAT range blocked ──────────────────────────────────────────
+
+
+def test_init_rejects_cgnat_api_base(monkeypatch):
+    import ipaddress
+    import socket as _socket
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(None, None, None, None, ("100.100.100.1", 0))]
+
+    monkeypatch.setattr(_socket, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(ValueError, match="CGNAT"):
+        CompresrGuardrail(
+            api_base="http://internal-compresr.example.com",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+# ── length guard: equal-length compressed output kept ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_equal_length_compressed_output_is_kept(guardrail: CompresrGuardrail):
+    original = "x" * 600
+    compressed = "y" * 600
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": original},
+    ]
+    mock_post = AsyncMock(
+        return_value=_make_single_compress_response(compressed_context=compressed)
+    )
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    assert result["structured_messages"][1]["content"] == original
+
+
+@pytest.mark.asyncio
+async def test_strictly_longer_compressed_output_is_dropped(guardrail: CompresrGuardrail):
+    original = "x" * 600
+    compressed = "y" * 601
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "c1", "content": original},
+    ]
+    mock_post = AsyncMock(
+        return_value=_make_single_compress_response(compressed_context=compressed)
+    )
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    assert result["structured_messages"][1]["content"] == original

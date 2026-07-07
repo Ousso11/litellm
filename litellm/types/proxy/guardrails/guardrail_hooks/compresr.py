@@ -1,4 +1,4 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -88,7 +88,7 @@ class CompresrGuardrailOptionalParams(BaseModel):
             "Unset lets the server default apply (~10.0)."
         ),
     )
-    compression_params: Optional[Dict[str, Any]] = Field(
+    compression_params: Optional[dict[str, object]] = Field(
         default=None,
         description=(
             "Passthrough of extra parameters forwarded verbatim in the Compresr "
@@ -118,8 +118,8 @@ class CompresrGuardrailConfigModel(GuardrailConfigModel[CompresrGuardrailOptiona
             "Compresr compression model (not the LLM). Defaults to 'latte_v2', the query-aware compression model."
         ),
     )
-    unreachable_fallback: Optional[Literal["fail_open", "fail_closed"]] = Field(
-        default=None,
+    unreachable_fallback: Literal["fail_closed", "fail_open"] = Field(
+        default="fail_closed",
         description=(
             "What to do when the Compresr service is unreachable. "
             "'fail_closed' (default) returns HTTP 502 to the caller. "

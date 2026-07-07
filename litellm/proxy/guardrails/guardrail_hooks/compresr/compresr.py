@@ -26,7 +26,6 @@ import json
 import re
 import socket
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Literal, Optional
 from urllib.parse import urlparse
 
@@ -569,15 +568,6 @@ class CompresrGuardrail(CustomGuardrail):
     ) -> Optional[list[dict[str, object]]]:
         """Compress ``contexts`` (query-aware). Returns one result dict per
         context, or None when the service failed and fail_open applies."""
-        try:
-            _validate_api_base(self.compresr_api_base)
-        except ValueError as exc:
-            self._handle_compress_failure(
-                "Compresr api_base failed SSRF re-validation at request time",
-                {"detail": str(exc)},
-            )
-            return None
-
         common: dict[str, object] = {
             **self.compression_params,
             "compression_model_name": self.compression_model,
@@ -785,10 +775,10 @@ class CompresrGuardrail(CustomGuardrail):
             duration=end_time - start_time,
         )
 
-        if not self.enable_retrieval or not originals:
+        call_id = _resolve_call_id(logging_obj)
+        if not self.enable_retrieval or not originals or call_id is None:
             return {**inputs, "structured_messages": compressed_messages}  # pyright: ignore[reportReturnType]  # plain dicts satisfy AllMessageValues at runtime
 
-        call_id = _resolve_call_id(logging_obj) or str(uuid.uuid4())
         self._store_originals(call_id, originals)
 
         existing_tools = inputs.get("tools")
