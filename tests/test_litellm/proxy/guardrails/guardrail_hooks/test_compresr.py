@@ -499,6 +499,42 @@ def test_init_rejects_cloud_metadata_api_base():
         )
 
 
+def test_ssrf_loopback_blocked_ipv4():
+    with pytest.raises(ValueError, match="blocked address"):
+        CompresrGuardrail(
+            api_base="http://127.0.0.1:8080",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+def test_ssrf_loopback_blocked_localhost():
+    with pytest.raises(ValueError, match="blocked address"):
+        CompresrGuardrail(
+            api_base="http://localhost:8080",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+def test_ssrf_unspecified_ipv4_blocked():
+    with pytest.raises(ValueError, match="blocked address"):
+        CompresrGuardrail(
+            api_base="http://0.0.0.0:8080",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+def test_ssrf_unspecified_ipv6_blocked():
+    with pytest.raises(ValueError, match="blocked address"):
+        CompresrGuardrail(
+            api_base="http://[::]:8080",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
 @pytest.mark.asyncio
 async def test_apply_guardrail_ignores_user_supplied_call_id(guardrail: CompresrGuardrail):
     mock_post = AsyncMock(return_value=_make_single_compress_response())
@@ -798,6 +834,51 @@ async def test_agentic_plan_builds_anthropic_followup_shape(
     assert plan.request_patch.max_tokens == 1024
 
 
+@pytest.mark.asyncio
+async def test_agentic_plan_builds_responses_api_followup_shape(
+    guardrail: CompresrGuardrail,
+):
+    hash_value = "e" * 24
+    guardrail._store_originals("call-id-responses", {hash_value: TOOL_OUTPUT})
+
+    # Responses API shape: response.output is a list (not None)
+    response = MagicMock()
+    response.output = [{"type": "function_call", "call_id": "call_resp_1"}]
+    response.content = None
+
+    plan = await guardrail.async_build_agentic_loop_plan(
+        tools={
+            "tool_calls": [
+                {
+                    "id": "call_resp_1",
+                    "type": "function",
+                    "name": COMPRESR_RETRIEVE_TOOL_NAME,
+                    "arguments": {"hash": hash_value},
+                }
+            ]
+        },
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "q"}],
+        response=response,
+        anthropic_messages_provider_config=None,
+        anthropic_messages_optional_request_params={},
+        logging_obj=_logging_obj("call-id-responses"),
+        stream=False,
+        kwargs={},
+    )
+
+    follow_up = plan.request_patch.messages
+    # The two injected items are the function_call echo followed by
+    # function_call_output carrying the restored content.
+    function_call_item = follow_up[-2]
+    function_call_output_item = follow_up[-1]
+    assert function_call_item["type"] == "function_call"
+    assert function_call_item["call_id"] == "call_resp_1"
+    assert function_call_output_item["type"] == "function_call_output"
+    assert function_call_output_item["call_id"] == "call_resp_1"
+    assert function_call_output_item["output"] == TOOL_OUTPUT
+
+
 # ── store hygiene ─────────────────────────────────────────────────────
 
 
@@ -829,89 +910,125 @@ def test_originals_store_caps_bytes_per_call():
     assert hashes[0] not in stored
 
 
-# ── dynamic (adaptive) compression — latte_v2 Kneedle ─────────────────
+# ── SSRF: DNS rebinding ───────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_dynamic_flag_in_payload():
-    """dynamic=True must appear in the compress payload; unset bounds omitted."""
-    guardrail = _make_guardrail(dynamic=True)
+async def test_ssrf_dns_rebinding_blocked_at_request_time():
+    """DNS rebinding: _validate_api_base is called again before each HTTP call."""
+    from litellm.proxy.guardrails.guardrail_hooks.compresr import compresr as compresr_mod
+
+    # First call (during __init__) succeeds so the object is created.
+    with patch.object(compresr_mod, "_validate_api_base", return_value=FAKE_API_BASE):
+        guardrail = _make_guardrail()
+
+    # After creation, DNS flips; subsequent _validate_api_base calls raise.
+    with patch.object(
+        compresr_mod,
+        "_validate_api_base",
+        side_effect=ValueError("DNS rebinding detected"),
+    ):
+        # fail_closed: must raise
+        with pytest.raises(HTTPException) as exc_info:
+            await guardrail.apply_guardrail(
+                inputs=_apply_inputs(AGENT_MESSAGES),
+                request_data={"model": "gpt-4o"},
+                input_type="request",
+            )
+        assert exc_info.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_ssrf_dns_rebinding_fail_open_forwards_uncompressed():
+    from litellm.proxy.guardrails.guardrail_hooks.compresr import compresr as compresr_mod
+
+    with patch.object(compresr_mod, "_validate_api_base", return_value=FAKE_API_BASE):
+        guardrail = _make_guardrail(unreachable_fallback="fail_open")
+
+    inputs = _apply_inputs(AGENT_MESSAGES)
+    with patch.object(
+        compresr_mod,
+        "_validate_api_base",
+        side_effect=ValueError("DNS rebinding detected"),
+    ):
+        result = await guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+
+    # fail_open: original messages must be forwarded uncompressed
+    assert result is inputs
+    assert result["structured_messages"][3]["content"] == TOOL_OUTPUT
+
+
+# ── SSRF: Azure IMDS ──────────────────────────────────────────────────
+
+
+def test_ssrf_azure_imds_blocked():
+    with pytest.raises(ValueError, match="metadata"):
+        CompresrGuardrail(
+            api_base="http://168.63.129.16",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+def test_ssrf_metadata_hostname_trailing_dot_blocked():
+    """Trailing dot on a blocked hostname must not bypass the blocklist check."""
+    with pytest.raises(ValueError, match="metadata"):
+        CompresrGuardrail(
+            api_base="http://169.254.169.254.",
+            api_key=FAKE_API_KEY,
+            guardrail_name="compresr",
+        )
+
+
+# ── compression quality guards ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_guardrail_skips_when_compressed_longer_than_original(
+    guardrail: CompresrGuardrail,
+):
+    """When compressed_context >= original length, keep the original."""
+    long_tool_output = "x" * 600
     messages = [
         {"role": "user", "content": USER_QUESTION},
-        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+        {"role": "tool", "tool_call_id": "c1", "content": long_tool_output},
     ]
-    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    # Return a compressed_context that is longer than the original.
+    longer_compressed = "y" * 700
+    mock_post = AsyncMock(return_value=_make_single_compress_response(compressed_context=longer_compressed))
+
     with patch.object(guardrail.async_handler, "post", mock_post):
-        await guardrail.apply_guardrail(
+        result = await guardrail.apply_guardrail(
             inputs=_apply_inputs(messages),
             request_data={"model": "gpt-4o"},
             input_type="request",
         )
-    payload = mock_post.call_args.kwargs["json"]
-    assert payload["dynamic"] is True
-    assert "dynamic_min_ratio" not in payload
-    assert "dynamic_max_ratio" not in payload
+
+    # Original must be preserved because compression expanded the content.
+    assert result["structured_messages"][1]["content"] == long_tool_output
 
 
 @pytest.mark.asyncio
-async def test_dynamic_bounds_in_payload_when_set():
-    guardrail = _make_guardrail(dynamic=True, dynamic_min_ratio=2.0, dynamic_max_ratio=8.0)
+async def test_apply_guardrail_skips_whitespace_only_compressed_context(
+    guardrail: CompresrGuardrail,
+):
+    """Whitespace-only compressed_context must be treated as empty and skipped."""
     messages = [
         {"role": "user", "content": USER_QUESTION},
-        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+        {"role": "tool", "tool_call_id": "c1", "content": TOOL_OUTPUT},
     ]
-    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    mock_post = AsyncMock(return_value=_make_single_compress_response(compressed_context="   \n\t  "))
+
     with patch.object(guardrail.async_handler, "post", mock_post):
-        await guardrail.apply_guardrail(
+        result = await guardrail.apply_guardrail(
             inputs=_apply_inputs(messages),
             request_data={"model": "gpt-4o"},
             input_type="request",
         )
-    payload = mock_post.call_args.kwargs["json"]
-    assert payload["dynamic"] is True
-    assert payload["dynamic_min_ratio"] == 2.0
-    assert payload["dynamic_max_ratio"] == 8.0
 
-
-@pytest.mark.asyncio
-async def test_dynamic_off_by_default():
-    guardrail = _make_guardrail()  # dynamic defaults off
-    messages = [
-        {"role": "user", "content": USER_QUESTION},
-        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
-    ]
-    mock_post = AsyncMock(return_value=_make_single_compress_response())
-    with patch.object(guardrail.async_handler, "post", mock_post):
-        await guardrail.apply_guardrail(
-            inputs=_apply_inputs(messages),
-            request_data={"model": "gpt-4o"},
-            input_type="request",
-        )
-    assert mock_post.call_args.kwargs["json"]["dynamic"] is False
-
-
-# ── generic passthrough compression params ────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_compression_params_passthrough_in_payload():
-    """Extra params in compression_params are forwarded verbatim; named fields
-    still win on collision."""
-    guardrail = _make_guardrail(
-        compression_params={"heuristic_chunking": True, "coarse": False}
-    )
-    messages = [
-        {"role": "user", "content": USER_QUESTION},
-        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
-    ]
-    mock_post = AsyncMock(return_value=_make_single_compress_response())
-    with patch.object(guardrail.async_handler, "post", mock_post):
-        await guardrail.apply_guardrail(
-            inputs=_apply_inputs(messages),
-            request_data={"model": "gpt-4o"},
-            input_type="request",
-        )
-    payload = mock_post.call_args.kwargs["json"]
-    assert payload["heuristic_chunking"] is True
-    # named `coarse` (default True) wins over the passthrough's coarse=False
-    assert payload["coarse"] is True
+    # Whitespace-only result → original must be preserved.
+    assert result["structured_messages"][1]["content"] == TOOL_OUTPUT

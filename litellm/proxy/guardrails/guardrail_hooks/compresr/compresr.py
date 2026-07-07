@@ -1,16 +1,21 @@
-"""Compresr guardrail — query-aware context compression with lossless recovery.
+"""Compresr guardrail: query-aware context compression with lossless recovery.
 
 Compresses bulky message content (tool outputs by default) through the
 Compresr API before the request reaches the LLM. Each compressed message
 carries a hash marker; a ``compresr_retrieve`` tool is injected so the model
 can fetch the original content back through the agentic loop when the
-compressed version is not enough — making compression recoverable instead
+compressed version is not enough, so compression is recoverable instead
 of lossy.
 
 Unlike gateway-side compressors that operate on whole message lists, each
 target is compressed *query-aware*: the query sent to Compresr is the intent
 of the tool call that produced the message (``name + arguments``, resolved
 via ``tool_call_id``), falling back to the last user message.
+
+# NOTE: originals are stored in process memory. Multi-worker deployments
+# (gunicorn/uvicorn --workers N > 1) will silently lose originals when
+# pre- and post-call hooks land on different workers. Set --workers 1
+# or disable recovery (enable_retrieval=False) in multi-worker setups.
 """
 
 from __future__ import annotations
@@ -77,10 +82,12 @@ _BLOCKED_METADATA_HOSTS = frozenset(
         "169.254.169.254",
         "fd00:ec2::254",
         "100.100.100.200",
+        "168.63.129.16",  # Azure IMDS / wire-server
         "metadata.google.internal",
         "metadata.goog",
     }
 )
+_CGNAT_RANGE = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _validate_api_base(url: str) -> str:
@@ -96,7 +103,7 @@ def _validate_api_base(url: str) -> str:
         raise ValueError(
             f"Compresr guardrail api_base must be http or https, got scheme={parsed.scheme!r}"
         )
-    host = (parsed.hostname or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
     if not host:
         raise ValueError("Compresr guardrail api_base has no host")
     if host in _BLOCKED_METADATA_HOSTS:
@@ -104,12 +111,21 @@ def _validate_api_base(url: str) -> str:
     try:
         for info in socket.getaddrinfo(host, None):
             addr = info[4][0]
-            if addr in _BLOCKED_METADATA_HOSTS or ipaddress.ip_address(addr).is_link_local:
+            ip = ipaddress.ip_address(addr)
+            if addr in _BLOCKED_METADATA_HOSTS or ip.is_link_local or ip.is_loopback or ip.is_unspecified:
                 raise ValueError(
                     f"Compresr guardrail api_base {host!r} resolves to blocked address {addr!r}"
                 )
+            if ip in _CGNAT_RANGE:
+                raise ValueError(
+                    f"Compresr guardrail api_base {host!r} resolves to CGNAT address {addr!r} (100.64.0.0/10)"
+                )
     except socket.gaierror:
-        pass
+        verbose_proxy_logger.warning(
+            "compresr: DNS resolution failed for %s at startup; SSRF validation skipped. "
+            "Ensure api_base is reachable before handling live traffic.", host
+        )
+        return url
     return url
 
 
@@ -481,7 +497,7 @@ class CompresrGuardrail(CustomGuardrail):
             if expiry > now
         }
         if len(alive) > _MAX_TRACKED_CALLS:
-            # Evict soonest-to-expire first — a hard cap so a burst of huge
+            # Evict soonest-to-expire first, a hard cap so a burst of huge
             # tool outputs cannot grow proxy memory unbounded.
             by_expiry = sorted(alive.items(), key=lambda item: item[1][1])
             alive = dict(by_expiry[len(alive) - _MAX_TRACKED_CALLS :])
@@ -541,6 +557,15 @@ class CompresrGuardrail(CustomGuardrail):
     ) -> Optional[list[dict[str, object]]]:
         """Compress ``contexts`` (query-aware). Returns one result dict per
         context, or None when the service failed and fail_open applies."""
+        try:
+            _validate_api_base(self.compresr_api_base)
+        except ValueError as exc:
+            self._handle_compress_failure(
+                "Compresr api_base failed SSRF re-validation at request time",
+                {"detail": str(exc)},
+            )
+            return None
+
         common: dict[str, object] = {
             # Passthrough first so the named fields below always win on collision.
             **self.compression_params,
@@ -711,8 +736,10 @@ class CompresrGuardrail(CustomGuardrail):
         tokens_after = 0
         for target_idx, original_text, result in zip(targets, contexts, results):
             compressed_text = result.get("compressed_context")
-            if not isinstance(compressed_text, str) or not compressed_text:
+            if not isinstance(compressed_text, str) or not compressed_text.strip():
                 continue
+            if len(compressed_text) >= len(original_text):
+                continue  # compression made it worse, keep original
             messages_compressed += 1
             if self.enable_retrieval:
                 hash_value = _content_hash(original_text)
