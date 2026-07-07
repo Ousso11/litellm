@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
@@ -65,6 +65,36 @@ class CompresrGuardrailOptionalParams(BaseModel):
             "Honor the `x-compresr-bypass: true` request header to skip "
             "compression for a single call. Off by default because the "
             "header is caller-settable; enable only on trusted deployments."
+        ),
+    )
+    dynamic: Optional[bool] = Field(
+        default=None,
+        description=(
+            "latte_v2 only. Let the server choose the compression amount per input "
+            "(Kneedle elbow) instead of using target_compression_ratio. Defaults to False."
+        ),
+    )
+    dynamic_min_ratio: Optional[float] = Field(
+        default=None,
+        description=(
+            "latte_v2 only. Floor on the adaptive ratio when `dynamic` is on. "
+            "Unset lets the server default apply (~1.5)."
+        ),
+    )
+    dynamic_max_ratio: Optional[float] = Field(
+        default=None,
+        description=(
+            "latte_v2 only. Ceiling on the adaptive ratio when `dynamic` is on. "
+            "Unset lets the server default apply (~10.0)."
+        ),
+    )
+    compression_params: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Passthrough of extra parameters forwarded verbatim in the Compresr "
+            "compress payload (e.g. `heuristic_chunking`, or any newer knob), so "
+            "a new Compresr feature works without a guardrail update. The named "
+            "fields above take precedence on collision."
         ),
     )
 

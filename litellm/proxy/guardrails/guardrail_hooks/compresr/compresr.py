@@ -398,6 +398,10 @@ class CompresrGuardrail(CustomGuardrail):
         unreachable_fallback: str | None = None,
         max_bytes_per_call: int | None = None,
         allow_bypass_header: bool | None = None,
+        dynamic: bool | None = None,
+        dynamic_min_ratio: float | None = None,
+        dynamic_max_ratio: float | None = None,
+        compression_params: dict | None = None,
     ):
         raw_api_base = (api_base or get_secret_str("COMPRESR_API_BASE") or DEFAULT_API_BASE).rstrip("/")
         self.compresr_api_base = _validate_api_base(raw_api_base)
@@ -427,6 +431,17 @@ class CompresrGuardrail(CustomGuardrail):
             _DEFAULT_MAX_BYTES_PER_CALL if max_bytes_per_call is None else max_bytes_per_call
         )
         self.allow_bypass_header = False if allow_bypass_header is None else allow_bypass_header
+        # Dynamic (adaptive) compression — latte_v2 only. When on, the server
+        # picks the ratio per input (Kneedle elbow) instead of honoring
+        # target_compression_ratio; None bounds let the server default apply.
+        self.dynamic = False if dynamic is None else dynamic
+        self.dynamic_min_ratio = dynamic_min_ratio
+        self.dynamic_max_ratio = dynamic_max_ratio
+        # Passthrough of extra compression params (e.g. heuristic_chunking, or a
+        # newer knob) forwarded verbatim in the compress payload, so a new
+        # Compresr feature works without changing this guardrail. Named fields
+        # win on collision.
+        self.compression_params: dict[str, object] = dict(compression_params or {})
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
@@ -552,11 +567,20 @@ class CompresrGuardrail(CustomGuardrail):
             return None
 
         common: dict[str, object] = {
+            # Passthrough first so the named fields below always win on collision.
+            **self.compression_params,
             "compression_model_name": self.compression_model,
             "target_compression_ratio": self.target_compression_ratio,
             "coarse": self.coarse,
+            "dynamic": self.dynamic,
             "source": _SOURCE_TAG,
         }
+        # Only send the bounds the operator actually set; otherwise let the
+        # server apply its own floor/ceiling.
+        if self.dynamic_min_ratio is not None:
+            common["dynamic_min_ratio"] = self.dynamic_min_ratio
+        if self.dynamic_max_ratio is not None:
+            common["dynamic_max_ratio"] = self.dynamic_max_ratio
         if len(contexts) == 1:
             url = f"{self.compresr_api_base}/api/compress/question-specific/"
             payload: dict[str, object] = {
