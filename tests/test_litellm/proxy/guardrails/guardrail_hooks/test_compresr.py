@@ -1062,3 +1062,62 @@ async def test_compression_params_cannot_override_context_in_payload():
     payload = mock_post.call_args.kwargs["json"]
     assert payload["context"] == TOOL_OUTPUT
     assert payload["heuristic_chunking"] is True
+
+
+# ── initialize_guardrail wiring ───────────────────────────────────────
+
+
+def test_initialize_guardrail_wires_optional_params():
+    """optional_params values must reach the CompresrGuardrail constructor.
+    This pins the _get_optional_value lookup so a future __init__.py refactor
+    cannot silently drop a param without failing here."""
+    from unittest.mock import MagicMock, patch
+
+    from litellm.proxy.guardrails.guardrail_hooks.compresr import initialize_guardrail
+    from litellm.types.proxy.guardrails.guardrail_hooks.compresr import (
+        CompresrGuardrailOptionalParams,
+    )
+
+    optional_params = CompresrGuardrailOptionalParams(
+        target_compression_ratio=0.3,
+        coarse=False,
+        min_chars_to_compress=200,
+        compress_system=True,
+        compress_history=True,
+        compress_last_user=True,
+        enable_retrieval=False,
+        max_bytes_per_call=1024,
+        allow_bypass_header=True,
+        dynamic=True,
+        dynamic_min_ratio=1.5,
+        dynamic_max_ratio=8.0,
+        compression_params={"heuristic_chunking": True},
+    )
+
+    litellm_params = MagicMock()
+    litellm_params.api_base = FAKE_API_BASE
+    litellm_params.api_key = FAKE_API_KEY
+    litellm_params.model = "latte_v2"
+    litellm_params.unreachable_fallback = "fail_open"
+    litellm_params.default_on = True
+    litellm_params.mode = "pre_call"
+    litellm_params.optional_params = optional_params
+
+    guardrail_config = {"guardrail_name": "compresr"}
+
+    with patch("litellm.logging_callback_manager.add_litellm_callback"):
+        g = initialize_guardrail(litellm_params, guardrail_config)
+
+    assert g.target_compression_ratio == 0.3
+    assert g.coarse is False
+    assert g.min_chars_to_compress == 200
+    assert g.compress_system is True
+    assert g.compress_history is True
+    assert g.compress_last_user is True
+    assert g.enable_retrieval is False
+    assert g.max_bytes_per_call == 1024
+    assert g.allow_bypass_header is True
+    assert g.dynamic is True
+    assert g.dynamic_min_ratio == 1.5
+    assert g.dynamic_max_ratio == 8.0
+    assert g.compression_params == {"heuristic_chunking": True}

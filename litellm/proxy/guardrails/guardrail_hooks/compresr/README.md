@@ -60,6 +60,10 @@ Optional tuning, under `optional_params`:
 | `enable_retrieval` | `true` | Inject the `compresr_retrieve` recovery tool |
 | `allow_bypass_header` | `false` | Honour `x-compresr-bypass: true` from callers (opt-in; off by default) |
 | `max_bytes_per_call` | `10485760` | Max bytes of stored originals per `litellm_call_id` (10 MiB); oldest evicted first |
+| `dynamic` | `false` | `latte_v2` only. Let the server choose the compression amount per input (Kneedle elbow) instead of using `target_compression_ratio` |
+| `dynamic_min_ratio` | server default (~1.5) | Floor on the adaptive ratio when `dynamic` is on |
+| `dynamic_max_ratio` | server default (~10.0) | Ceiling on the adaptive ratio when `dynamic` is on |
+| `compression_params` | `{}` | Extra parameters forwarded verbatim to the Compresr API (e.g. `heuristic_chunking: true`). Protected fields (`context`, `query`, `coarse`, `source`, etc.) are ignored to prevent accidental overrides |
 
 ## Per-request bypass
 
