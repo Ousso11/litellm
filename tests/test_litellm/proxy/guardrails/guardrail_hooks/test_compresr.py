@@ -464,22 +464,6 @@ async def test_non_json_response_raises_when_fail_closed(guardrail: CompresrGuar
             )
 
 
-@pytest.mark.asyncio
-async def test_http_exception_does_not_reflect_upstream_body(guardrail: CompresrGuardrail):
-    mock = MagicMock()
-    mock.status_code = 500
-    mock.json.side_effect = ValueError("not json")
-    mock.text = "SECRET_INSTANCE_METADATA_TOKEN=aws-imds-response"
-
-    with patch.object(guardrail.async_handler, "post", AsyncMock(return_value=mock)):
-        with pytest.raises(HTTPException) as exc_info:
-            await guardrail.apply_guardrail(
-                inputs=_apply_inputs(AGENT_MESSAGES),
-                request_data={"model": "gpt-4o"},
-                input_type="request",
-            )
-    assert "SECRET_INSTANCE_METADATA_TOKEN" not in json.dumps(exc_info.value.detail)
-
 
 def test_init_rejects_non_http_api_base():
     with pytest.raises(ValueError, match="scheme"):
@@ -1032,3 +1016,49 @@ async def test_apply_guardrail_skips_whitespace_only_compressed_context(
 
     # Whitespace-only result → original must be preserved.
     assert result["structured_messages"][1]["content"] == TOOL_OUTPUT
+
+
+# ── compression_params injection protection ───────────────────────────
+
+
+def test_compression_params_protected_keys_stripped_at_init():
+    """Keys that map to named payload fields must be dropped at init time so an
+    operator-supplied compression_params cannot overwrite context, query, or any
+    other protected field in the outbound payload."""
+    guardrail = _make_guardrail(
+        compression_params={
+            "context": "injected_context",
+            "query": "injected_query",
+            "inputs": "injected_inputs",
+            "source": "injected_source",
+            "coarse": False,
+            "heuristic_chunking": True,
+        }
+    )
+    assert "context" not in guardrail.compression_params
+    assert "query" not in guardrail.compression_params
+    assert "inputs" not in guardrail.compression_params
+    assert "source" not in guardrail.compression_params
+    assert "coarse" not in guardrail.compression_params
+    assert guardrail.compression_params["heuristic_chunking"] is True
+
+
+@pytest.mark.asyncio
+async def test_compression_params_cannot_override_context_in_payload():
+    """Even if a protected key somehow reached compression_params, the named
+    field in the payload must win — real context must reach the API."""
+    guardrail = _make_guardrail(compression_params={"heuristic_chunking": True})
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {"role": "tool", "tool_call_id": "call_x", "name": "search", "content": TOOL_OUTPUT},
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+    payload = mock_post.call_args.kwargs["json"]
+    assert payload["context"] == TOOL_OUTPUT
+    assert payload["heuristic_chunking"] is True

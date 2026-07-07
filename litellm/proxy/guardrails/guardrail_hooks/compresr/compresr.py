@@ -76,7 +76,21 @@ _HASH_PATTERN = re.compile(r"compresr hash=([a-f0-9]{24})")
 _ORIGINALS_TTL_SECONDS = 15 * 60
 _MAX_TRACKED_CALLS = 256
 _DEFAULT_MAX_BYTES_PER_CALL = 10 * 1024 * 1024
-_SOURCE_TAG = "gateway:unknown"
+_SOURCE_TAG = "gateway:litellm"
+_PROTECTED_PAYLOAD_KEYS: frozenset[str] = frozenset(
+    {
+        "context",
+        "query",
+        "inputs",
+        "compression_model_name",
+        "target_compression_ratio",
+        "coarse",
+        "dynamic",
+        "dynamic_min_ratio",
+        "dynamic_max_ratio",
+        "source",
+    }
+)
 _BLOCKED_METADATA_HOSTS = frozenset(
     {
         "169.254.169.254",
@@ -401,7 +415,7 @@ class CompresrGuardrail(CustomGuardrail):
         dynamic: bool | None = None,
         dynamic_min_ratio: float | None = None,
         dynamic_max_ratio: float | None = None,
-        compression_params: dict | None = None,
+        compression_params: dict[str, object] | None = None,
     ):
         raw_api_base = (api_base or get_secret_str("COMPRESR_API_BASE") or DEFAULT_API_BASE).rstrip("/")
         self.compresr_api_base = _validate_api_base(raw_api_base)
@@ -431,17 +445,14 @@ class CompresrGuardrail(CustomGuardrail):
             _DEFAULT_MAX_BYTES_PER_CALL if max_bytes_per_call is None else max_bytes_per_call
         )
         self.allow_bypass_header = False if allow_bypass_header is None else allow_bypass_header
-        # Dynamic (adaptive) compression — latte_v2 only. When on, the server
-        # picks the ratio per input (Kneedle elbow) instead of honoring
-        # target_compression_ratio; None bounds let the server default apply.
         self.dynamic = False if dynamic is None else dynamic
         self.dynamic_min_ratio = dynamic_min_ratio
         self.dynamic_max_ratio = dynamic_max_ratio
-        # Passthrough of extra compression params (e.g. heuristic_chunking, or a
-        # newer knob) forwarded verbatim in the compress payload, so a new
-        # Compresr feature works without changing this guardrail. Named fields
-        # win on collision.
-        self.compression_params: dict[str, object] = dict(compression_params or {})
+        self.compression_params: dict[str, object] = {
+            k: v
+            for k, v in (compression_params or {}).items()
+            if k not in _PROTECTED_PAYLOAD_KEYS
+        }
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
@@ -520,19 +531,20 @@ class CompresrGuardrail(CustomGuardrail):
         large tool outputs from growing proxy memory without bound."""
         if self.max_bytes_per_call <= 0:
             return merged
-        total = sum(len(value.encode("utf-8")) for value in merged.values())
+        total = sum(len(v.encode("utf-8")) for v in merged.values())
         if total <= self.max_bytes_per_call:
             return merged
-        bounded = dict(merged)
-        for key in list(bounded.keys()):
-            if total <= self.max_bytes_per_call:
-                break
-            total -= len(bounded[key].encode("utf-8"))
-            del bounded[key]
-            verbose_proxy_logger.warning(
-                "Compresr: originals-store byte cap hit, evicted hash=%s", key
-            )
-        return bounded
+        running = total
+        result: dict[str, str] = {}
+        for key, value in merged.items():
+            if running > self.max_bytes_per_call:
+                verbose_proxy_logger.warning(
+                    "Compresr: originals-store byte cap hit, evicted hash=%s", key
+                )
+                running -= len(value.encode("utf-8"))
+            else:
+                result[key] = value
+        return result
 
     def _retrieve_original(self, call_id: Optional[str], hash_value: str) -> str:
         if call_id:
@@ -567,7 +579,6 @@ class CompresrGuardrail(CustomGuardrail):
             return None
 
         common: dict[str, object] = {
-            # Passthrough first so the named fields below always win on collision.
             **self.compression_params,
             "compression_model_name": self.compression_model,
             "target_compression_ratio": self.target_compression_ratio,
@@ -575,8 +586,6 @@ class CompresrGuardrail(CustomGuardrail):
             "dynamic": self.dynamic,
             "source": _SOURCE_TAG,
         }
-        # Only send the bounds the operator actually set; otherwise let the
-        # server apply its own floor/ceiling.
         if self.dynamic_min_ratio is not None:
             common["dynamic_min_ratio"] = self.dynamic_min_ratio
         if self.dynamic_max_ratio is not None:
