@@ -14,6 +14,7 @@ Tests cover:
 - fail_closed raises HTTPException; fail_open forwards uncompressed
 """
 
+import asyncio
 import hashlib
 import json
 from types import SimpleNamespace
@@ -360,6 +361,54 @@ async def test_multimodal_text_replaced_non_text_preserved(
     assert content[1] == image_part
 
 
+@pytest.mark.asyncio
+async def test_multimodal_multiple_text_parts_collapsed_into_first(
+    guardrail: CompresrGuardrail,
+):
+    """A tool message with two text parts: _content_to_text joins them both with
+    '\\n\\n' and that concatenation is what Compresr receives and compresses.
+    _replace_text_in_content puts the compressed result in the first text slot;
+    the second text part is dropped from the visible content (it is included in
+    the compressed representation and recoverable via compresr_retrieve).
+    Non-text parts pass through untouched."""
+    image_part = {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+    messages = [
+        {"role": "user", "content": USER_QUESTION},
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [
+                {"type": "text", "text": TOOL_OUTPUT},
+                image_part,
+                {"type": "text", "text": "Part 2: additional detail. " * 30},
+            ],
+        },
+    ]
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(messages),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
+
+    payload = mock_post.call_args.kwargs["json"]
+    # The context sent to Compresr is the full concatenation of both text parts.
+    assert TOOL_OUTPUT in payload["context"]
+    assert "Part 2" in payload["context"]
+
+    content = result["structured_messages"][1]["content"]
+    assert isinstance(content, list)
+    # First text slot carries the compressed output.
+    assert content[0]["type"] == "text"
+    assert content[0]["text"].startswith("compressed summary")
+    # The image passes through untouched.
+    assert content[1] == image_part
+    # The second text part is collapsed into the first (no duplicate text slot).
+    assert len([p for p in content if isinstance(p, dict) and p.get("type") == "text"]) == 1
+
+
 # ── passthrough / bypass ─────────────────────────────────────────────
 
 
@@ -444,6 +493,40 @@ async def test_transport_error_fail_open_forwards_uncompressed():
             input_type="request",
         )
 
+    assert result is inputs
+    assert result["structured_messages"][3]["content"] == TOOL_OUTPUT
+
+
+@pytest.mark.asyncio
+async def test_asyncio_timeout_error_raises_when_fail_closed(guardrail: CompresrGuardrail):
+    with patch.object(
+        guardrail.async_handler,
+        "post",
+        AsyncMock(side_effect=asyncio.TimeoutError()),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await guardrail.apply_guardrail(
+                inputs=_apply_inputs(AGENT_MESSAGES),
+                request_data={"model": "gpt-4o"},
+                input_type="request",
+            )
+    assert exc_info.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_asyncio_timeout_error_fail_open_forwards_uncompressed():
+    guardrail = _make_guardrail(unreachable_fallback="fail_open")
+    inputs = _apply_inputs(AGENT_MESSAGES)
+    with patch.object(
+        guardrail.async_handler,
+        "post",
+        AsyncMock(side_effect=asyncio.TimeoutError()),
+    ):
+        result = await guardrail.apply_guardrail(
+            inputs=inputs,
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+        )
     assert result is inputs
     assert result["structured_messages"][3]["content"] == TOOL_OUTPUT
 

@@ -20,6 +20,7 @@ via ``tool_call_id``), falling back to the last user message.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -142,11 +143,11 @@ def _validate_api_base(url: str) -> str:
     return url
 
 
-def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
+def _is_str_object_dict(value: object) -> TypeGuard[dict[str, object]]:  # fmt: skip
     return isinstance(value, dict)
 
 
-def _is_object_list(value: object) -> TypeGuard[list[object]]:  # guard-ok: isinstance narrows correctly; predicate is trivially correct  # fmt: skip
+def _is_object_list(value: object) -> TypeGuard[list[object]]:  # fmt: skip
     return isinstance(value, list)
 
 
@@ -507,8 +508,6 @@ class CompresrGuardrail(CustomGuardrail):
             if expiry > now
         }
         if len(alive) > _MAX_TRACKED_CALLS:
-            # Evict soonest-to-expire first, a hard cap so a burst of huge
-            # tool outputs cannot grow proxy memory unbounded.
             by_expiry = sorted(alive.items(), key=lambda item: item[1][1])
             alive = dict(by_expiry[len(alive) - _MAX_TRACKED_CALLS :])
         self._originals_by_call_id = alive
@@ -520,8 +519,6 @@ class CompresrGuardrail(CustomGuardrail):
             merged,
             time.monotonic() + _ORIGINALS_TTL_SECONDS,
         )
-        # Prune after inserting so the cap holds; the entry just added has the
-        # latest expiry and always survives eviction.
         self._prune_originals()
 
     def _bound_call_bytes(self, merged: dict[str, str]) -> dict[str, str]:
@@ -600,7 +597,7 @@ class CompresrGuardrail(CustomGuardrail):
                 json=payload,
                 headers=self._request_headers(),
             )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.TransportError, litellm.Timeout) as e:
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.TransportError, litellm.Timeout, asyncio.TimeoutError) as e:
             self._handle_compress_failure(
                 "Compresr compression service unreachable",
                 {"detail": str(e)},
@@ -640,8 +637,6 @@ class CompresrGuardrail(CustomGuardrail):
             or len(results) != len(contexts)
             or not all(_is_str_object_dict(r) for r in results)
         ):
-            # Anything but a 1:1 dict-per-context mapping would misalign
-            # results with their target messages.
             self._handle_compress_failure(
                 "Compresr batch response missing or mismatched 'results'",
                 {"expected": len(contexts), "got": len(results) if _is_object_list(results) else None},
@@ -711,8 +706,6 @@ class CompresrGuardrail(CustomGuardrail):
         targets = [
             idx
             for idx in self._select_targets(messages, query_idx)
-            # latte models require a non-empty query; leave targets we cannot
-            # derive one for uncompressed rather than erroring.
             if _query_for_target(messages, idx, fallback_query).strip()
         ]
         if not targets:
@@ -738,7 +731,7 @@ class CompresrGuardrail(CustomGuardrail):
             if not isinstance(compressed_text, str) or not compressed_text.strip():
                 continue
             if len(compressed_text) >= len(original_text):
-                continue  # compression made it worse, keep original
+                continue
             messages_compressed += 1
             if self.enable_retrieval:
                 hash_value = _content_hash(original_text)
@@ -833,7 +826,7 @@ class CompresrGuardrail(CustomGuardrail):
         retrieved: list[tuple[dict[str, object], str]] = []
         for tc in tool_calls:
             arguments = tc.get("arguments", {})
-            hash_value = str(arguments.get("hash", "")) if isinstance(arguments, dict) else ""
+            hash_value = str(arguments.get("hash", ""))
             content = self._retrieve_original(call_id, hash_value)
             verbose_proxy_logger.debug("Compresr retrieve: hash=%s -> %d chars", hash_value, len(content))
             retrieved.append((tc, content))
