@@ -75,7 +75,7 @@ _DEFAULT_MAX_BYTES_PER_CALL = 10 * 1024 * 1024
 # the request coroutine and a pooled connection for 10 minutes). Bound it so a
 # stall is routed through the fail policy quickly instead.
 _COMPRESS_TIMEOUT_SECONDS = 60.0
-_SOURCE_TAG = "gateway:litellm"
+_SOURCE_TAG = "integration:litellm"
 # Request-content fields the compression_params passthrough must never
 # override — they carry the actual message content/queries being compressed.
 _RESERVED_COMPRESSION_PARAM_KEYS = frozenset({"context", "query", "inputs"})
