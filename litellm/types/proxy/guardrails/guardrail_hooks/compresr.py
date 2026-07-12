@@ -48,7 +48,10 @@ class CompresrGuardrailOptionalParams(BaseModel):
         description=(
             "Make compression recoverable: inject a `compresr_retrieve` tool "
             "so the model can fetch the original content behind a compression "
-            "marker via the agentic loop. Defaults to True."
+            "marker via the agentic loop. Defaults to True. Set to False (or "
+            "run the proxy with --workers 1) for multi-worker deployments: "
+            "the recovery store is per-process, so pre-call and retrieval hooks "
+            "on different workers cannot see each other's originals."
         ),
     )
     max_bytes_per_call: Optional[int] = Field(

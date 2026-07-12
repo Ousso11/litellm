@@ -19,7 +19,7 @@ import hashlib
 import ipaddress
 import json
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Optional
 from urllib.parse import urlparse
@@ -608,7 +608,12 @@ class CompresrGuardrail(CustomGuardrail):
         self.async_handler = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.GuardrailCallback,
         )
-        self._originals_by_call_id: dict[str, tuple[dict[str, str], float]] = {}
+        self._originals_by_call_id: OrderedDict[str, tuple[dict[str, str], float]] = OrderedDict()
+        if self.enable_retrieval:
+            verbose_proxy_logger.warning(
+                "Compresr: enable_retrieval is on; the recovery store is per-process. "
+                "For multi-worker deployments, set enable_retrieval=false or run with --workers 1."
+            )
         super().__init__(  # pyright: ignore[reportUnknownMemberType]  # CustomGuardrail.__init__ is untyped
             guardrail_name=guardrail_name,
             event_hook=event_hook,
@@ -639,7 +644,7 @@ class CompresrGuardrail(CustomGuardrail):
         a generic message so a malicious ``api_base`` cannot exfiltrate response
         bytes through the client-visible error."""
         if self.unreachable_fallback == "fail_open":
-            verbose_proxy_logger.critical(
+            verbose_proxy_logger.warning(
                 "Compresr: %s; fail_open configured, forwarding request uncompressed. detail=%s",
                 error,
                 log_detail,
@@ -649,18 +654,16 @@ class CompresrGuardrail(CustomGuardrail):
         raise HTTPException(status_code=502, detail={"error": error})
 
     def _prune_originals(self) -> None:
+        # Insertion order == expiry order (shared TTL); prune from the front.
         now = time.monotonic()
-        alive = {
-            call_id: (originals, expiry)
-            for call_id, (originals, expiry) in self._originals_by_call_id.items()
-            if expiry > now
-        }
-        if len(alive) > _MAX_TRACKED_CALLS:
-            # Evict soonest-to-expire first — a hard cap so a burst of huge
-            # tool outputs cannot grow proxy memory unbounded.
-            by_expiry = sorted(alive.items(), key=lambda item: item[1][1])
-            alive = dict(by_expiry[len(alive) - _MAX_TRACKED_CALLS :])
-        self._originals_by_call_id = alive
+        store = self._originals_by_call_id
+        while store:
+            oldest_key = next(iter(store))
+            if store[oldest_key][1] > now:
+                break
+            del store[oldest_key]
+        while len(store) > _MAX_TRACKED_CALLS:
+            store.popitem(last=False)
 
     def _store_originals(self, store_key: str, originals: dict[str, str]) -> None:
         existing, _ = self._originals_by_call_id.get(store_key, ({}, 0.0))
@@ -669,8 +672,7 @@ class CompresrGuardrail(CustomGuardrail):
             merged,
             time.monotonic() + _ORIGINALS_TTL_SECONDS,
         )
-        # Prune after inserting so the cap holds; the entry just added has the
-        # latest expiry and always survives eviction.
+        self._originals_by_call_id.move_to_end(store_key)
         self._prune_originals()
 
     def _bound_call_bytes(self, merged: dict[str, str]) -> dict[str, str]:

@@ -1318,10 +1318,8 @@ def test_originals_store_caps_bytes_per_call():
 
 
 def test_originals_store_byte_cap_survives_lone_surrogates():
-    # Regression: eviction subtraction used bare encode("utf-8"), which crashed
-    # on lone surrogates (reachable via JSON \uXXXX escapes) and bypassed the
-    # fail policy as a 500. Every encode in the byte cap path must use
-    # surrogatepass to match the hash function.
+    # Regression: eviction path must use surrogatepass to match the hash
+    # function; a bare encode("utf-8") crashed on lone surrogates.
     guardrail = _make_guardrail(max_bytes_per_call=500)
     surrogate_value = "\ud800" * 60
     hashes = tuple(f"{i:024x}" for i in range(3))
