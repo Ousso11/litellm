@@ -686,7 +686,7 @@ class CompresrGuardrail(CustomGuardrail):
         for key in list(bounded.keys()):
             if total <= self.max_bytes_per_call:
                 break
-            total -= len(bounded[key].encode("utf-8"))
+            total -= len(bounded[key].encode("utf-8", "surrogatepass"))
             del bounded[key]
             verbose_proxy_logger.warning("Compresr: originals-store byte cap hit, evicted hash=%s", key)
         return bounded

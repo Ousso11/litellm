@@ -1317,6 +1317,21 @@ def test_originals_store_caps_bytes_per_call():
     assert hashes[0] not in stored
 
 
+def test_originals_store_byte_cap_survives_lone_surrogates():
+    # Regression: eviction subtraction used bare encode("utf-8"), which crashed
+    # on lone surrogates (reachable via JSON \uXXXX escapes) and bypassed the
+    # fail policy as a 500. Every encode in the byte cap path must use
+    # surrogatepass to match the hash function.
+    guardrail = _make_guardrail(max_bytes_per_call=500)
+    surrogate_value = "\ud800" * 60
+    hashes = tuple(f"{i:024x}" for i in range(3))
+    guardrail._store_originals("c", dict(zip(hashes, (surrogate_value, surrogate_value, surrogate_value))))
+
+    stored, _expiry = guardrail._originals_by_call_id["c"]
+    assert hashes[-1] in stored
+    assert hashes[0] not in stored
+
+
 # ── dynamic (adaptive) compression — latte_v2 Kneedle ─────────────────
 
 
