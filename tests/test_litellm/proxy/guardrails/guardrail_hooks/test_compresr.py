@@ -1277,7 +1277,6 @@ async def test_legacy_function_call_intent_used_as_query(guardrail: CompresrGuar
 
 
 def test_init_rejects_cgnat_api_base(monkeypatch):
-    import ipaddress
     import socket as _socket
 
     def fake_getaddrinfo(host, port, *args, **kwargs):
