@@ -15,6 +15,7 @@ via ``tool_call_id``), falling back to the last user message.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -586,6 +587,10 @@ class CompresrGuardrail(CustomGuardrail):
             "fail_open" if unreachable_fallback == "fail_open" else "fail_closed"
         )
         self.max_bytes_per_call = _DEFAULT_MAX_BYTES_PER_CALL if max_bytes_per_call is None else max_bytes_per_call
+        if self.max_bytes_per_call < 0:
+            raise ValueError(
+                "max_bytes_per_call must be >= 0 (0 disables the cap; positive values enforce it)"
+            )
         self.allow_bypass_header = False if allow_bypass_header is None else allow_bypass_header
         # Dynamic (adaptive) compression — latte_v2 only. When on, the server
         # picks the ratio per input (Kneedle elbow) instead of honoring
@@ -751,6 +756,8 @@ class CompresrGuardrail(CustomGuardrail):
                 headers=self._request_headers(),
                 timeout=_COMPRESS_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            raise
         except httpx.HTTPStatusError as e:
             # The shared handler calls raise_for_status(), so a non-2xx reply
             # arrives here rather than as a returned Response — and the raised
@@ -963,11 +970,13 @@ class CompresrGuardrail(CustomGuardrail):
         if results is None:  # service failed, fail_open configured
             return inputs
 
-        # Recovery needs a per-tenant store key (caller identity + framework
-        # call id, see _scoped_store_key). Without a call id we cannot serve
-        # originals back safely, so we compress without markers.
+        # Recovery needs a per-tenant store key. Without a caller scope (proxy
+        # runs without per-key auth) the store key would fall back to the
+        # client-settable call id, letting one caller retrieve another's
+        # originals by reusing the id; skip retrieval instead.
         store_key = _scoped_store_key(logging_obj)
-        recovery_enabled = self.enable_retrieval and store_key is not None
+        scope = _caller_scope(logging_obj)
+        recovery_enabled = self.enable_retrieval and store_key is not None and bool(scope)
 
         applied = self._apply_compression_results(messages, targets, contexts, results, recovery_enabled)
         if applied.messages_compressed == 0:
@@ -1079,9 +1088,8 @@ class CompresrGuardrail(CustomGuardrail):
             ]
             follow_up_messages = list(messages) + [assistant_message] + tool_results
 
-        max_tokens: Optional[int] = anthropic_messages_optional_request_params.get("max_tokens") or kwargs.get(
-            "max_tokens"
-        )
+        anthropic_max = anthropic_messages_optional_request_params.get("max_tokens")
+        max_tokens: Optional[int] = anthropic_max if anthropic_max is not None else kwargs.get("max_tokens")
         optional_params_without_max_tokens = {
             k: v for k, v in anthropic_messages_optional_request_params.items() if k != "max_tokens"
         }

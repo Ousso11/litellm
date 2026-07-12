@@ -26,6 +26,7 @@ from fastapi import HTTPException
 from litellm.proxy.guardrails.guardrail_hooks.compresr.compresr import (
     COMPRESR_RETRIEVE_TOOL_NAME,
     CompresrGuardrail,
+    _scoped_store_key,
     has_compresr_retrieve_tool,
 )
 from litellm.types.utils import GenericGuardrailAPIInputs
@@ -171,7 +172,17 @@ def _apply_inputs(messages: list) -> GenericGuardrailAPIInputs:
 
 
 def _logging_obj(call_id: str) -> SimpleNamespace:
-    return SimpleNamespace(litellm_call_id=call_id)
+    # Default fixture models a proxy with per-key auth enabled (the production
+    # shape). Recovery requires a caller scope; tests that need the no-auth
+    # path should build the object explicitly.
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    return SimpleNamespace(
+        litellm_call_id=call_id,
+        model_call_details={
+            "litellm_params": {"metadata": {"user_api_key_auth": UserAPIKeyAuth(api_key="hash-default")}}
+        },
+    )
 
 
 def _logging_obj_with_key(call_id: str, user_api_key: str, meta_key: str = "metadata") -> SimpleNamespace:
@@ -743,8 +754,8 @@ async def test_apply_guardrail_ignores_user_supplied_call_id(guardrail: Compresr
             logging_obj=_logging_obj("real-framework-call-id"),
         )
 
-    assert attacker_call_id not in guardrail._originals_by_call_id
-    assert "real-framework-call-id" in guardrail._originals_by_call_id
+    assert not any(attacker_call_id in k for k in guardrail._originals_by_call_id)
+    assert any(k.endswith("real-framework-call-id") for k in guardrail._originals_by_call_id)
 
 
 @pytest.mark.asyncio
@@ -859,10 +870,10 @@ async def test_caller_scope_rejects_forged_user_api_key_string(guardrail: Compre
             logging_obj=logging_obj,
         )
 
-    # The forged string is ignored: scope is empty, so the bucket is the bare
-    # call id, never the victim's scope.
-    assert "call-forge" in guardrail._originals_by_call_id
-    assert "victim-tenant-hash\x00call-forge" not in guardrail._originals_by_call_id
+    # Forged string is ignored: scope resolves to empty, so recovery is
+    # disabled entirely (no bucket keyed on victim-tenant-hash, no unscoped
+    # bucket that another caller could reuse).
+    assert not guardrail._originals_by_call_id
 
 
 @pytest.mark.asyncio
@@ -929,7 +940,8 @@ async def test_recovery_marker_tool_injection_and_original_stored(
     tools = result.get("tools")
     assert tools is not None and has_compresr_retrieve_tool(tools)
 
-    originals, _expiry = guardrail._originals_by_call_id["call-id-1"]
+    scoped_key = next(k for k in guardrail._originals_by_call_id if k.endswith("call-id-1"))
+    originals, _expiry = guardrail._originals_by_call_id[scoped_key]
     assert originals[expected_hash] == TOOL_OUTPUT
 
 
@@ -1017,7 +1029,7 @@ async def test_async_should_run_agentic_loop_false_without_retrieve_tool(
 @pytest.mark.asyncio
 async def test_agentic_plan_returns_stored_original(guardrail: CompresrGuardrail):
     hash_value = hashlib.sha256(TOOL_OUTPUT.encode()).hexdigest()[:24]
-    guardrail._store_originals("call-id-1", {hash_value: TOOL_OUTPUT})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: TOOL_OUTPUT})
 
     plan = await guardrail.async_build_agentic_loop_plan(
         tools={
@@ -1055,7 +1067,7 @@ async def test_agentic_plan_preserves_list_shaped_assistant_text(guardrail: Comp
     """Some providers return chat assistant content as list-of-parts; the
     retrieval follow-up must keep that text, not drop it to None."""
     hash_value = "a" * 24
-    guardrail._store_originals("call-id-1", {hash_value: "original"})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: "original"})
     response = _make_openai_response_with_tool_calls(
         [(COMPRESR_RETRIEVE_TOOL_NAME, {"hash": hash_value}, "call_r")],
         content=[{"type": "text", "text": "Let me fetch the original."}],
@@ -1118,7 +1130,7 @@ async def test_agentic_plan_builds_anthropic_followup_shape(
     guardrail: CompresrGuardrail,
 ):
     hash_value = "c" * 24
-    guardrail._store_originals("call-id-1", {hash_value: TOOL_OUTPUT})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: TOOL_OUTPUT})
 
     response = MagicMock()
     response.output = None
@@ -1162,7 +1174,7 @@ async def test_agentic_plan_builds_responses_followup_shape(
     """The /v1/responses path echoes the function_call and pairs it with a
     function_call_output keyed by the same call_id."""
     hash_value = "e" * 24
-    guardrail._store_originals("call-id-1", {hash_value: TOOL_OUTPUT})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: TOOL_OUTPUT})
 
     response = MagicMock()
     response.output = [{"type": "function_call", "call_id": "fc_1"}]  # responses-API shape
@@ -1206,7 +1218,7 @@ async def test_agentic_plan_chat_parallel_tool_calls_echoes_only_retrieve(
     every echoed tool_call must have a matching tool result or the provider 400s.
     The real call is re-planned by the follow-up; the assistant text is kept."""
     hash_value = "f" * 24
-    guardrail._store_originals("call-id-1", {hash_value: TOOL_OUTPUT})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: TOOL_OUTPUT})
 
     response = _make_openai_response_with_tool_calls(
         [
@@ -1247,7 +1259,7 @@ async def test_agentic_plan_anthropic_parallel_preserves_text_and_balances(
     real tool_use is dropped (re-planned), and the reconstructed turn stays
     balanced — one tool_result per echoed tool_use."""
     hash_value = "a" * 23 + "9"
-    guardrail._store_originals("call-id-1", {hash_value: TOOL_OUTPUT})
+    guardrail._store_originals(_scoped_store_key(_logging_obj("call-id-1")), {hash_value: TOOL_OUTPUT})
 
     response = MagicMock()
     response.output = None
@@ -1698,3 +1710,78 @@ def test_config_model_exposes_unreachable_fallback():
     field = CompresrGuardrailConfigModel.model_fields.get("unreachable_fallback")
     assert field is not None
     assert field.default == "fail_closed"
+
+
+# ── audit fixes ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_propagates_not_swallowed():
+    # Regression: CancelledError is a BaseException, not caught by
+    # (RequestError, Timeout). It must re-raise so cooperative cancellation
+    # (asyncio.wait_for, client disconnect) still fires.
+    import asyncio as _asyncio
+    guardrail = _make_guardrail(unreachable_fallback="fail_open")
+    with patch.object(guardrail.async_handler, "post", AsyncMock(side_effect=_asyncio.CancelledError())):
+        with pytest.raises(_asyncio.CancelledError):
+            await guardrail.apply_guardrail(
+                inputs=_apply_inputs(AGENT_MESSAGES),
+                request_data={"model": "gpt-4o"},
+                input_type="request",
+            )
+
+
+def test_max_bytes_per_call_negative_rejected():
+    # Regression: a negative value silently disabled the byte cap (< 0 behaves
+    # like 0 in _bound_call_bytes). Validate at construction so the footgun
+    # surfaces as a ValueError at startup, not silent unbounded storage.
+    with pytest.raises(ValueError, match="max_bytes_per_call"):
+        _make_guardrail(max_bytes_per_call=-1)
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_zero_from_optional_params_wins_over_kwargs():
+    # Regression: `or` short-circuits on falsy values, so an explicit
+    # max_tokens=0 from optional_params fell through to kwargs["max_tokens"].
+    # Must use `is not None`.
+    guardrail = _make_guardrail()
+    response = MagicMock()
+    response.content = [{"type": "tool_use", "id": "toolu_1"}]
+    plan = await guardrail.async_build_agentic_loop_plan(
+        tools={"tool_calls": [{
+            "id": "toolu_1",
+            "type": "function",
+            "name": COMPRESR_RETRIEVE_TOOL_NAME,
+            "arguments": {"hash": "deadbeef"},
+        }]},
+        model="claude-sonnet-5",
+        messages=[{"role": "user", "content": "q"}],
+        response=response,
+        anthropic_messages_provider_config=None,
+        anthropic_messages_optional_request_params={"max_tokens": 0},
+        logging_obj=_logging_obj("call-1"),
+        stream=False,
+        kwargs={"max_tokens": 999},
+    )
+    assert plan.request_patch.max_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_disabled_when_no_caller_scope():
+    # Regression: on a no-auth deployment (no UserAPIKeyAuth in metadata) the
+    # store key would fall back to the client-settable call id alone, letting
+    # any caller retrieve any other caller's originals. Recovery must be off.
+    guardrail = _make_guardrail()
+    logging_obj = MagicMock()
+    logging_obj.litellm_call_id = "call-abc"
+    logging_obj.model_call_details = {"litellm_params": {"metadata": {}}}
+    mock_post = AsyncMock(return_value=_make_single_compress_response())
+    with patch.object(guardrail.async_handler, "post", mock_post):
+        result = await guardrail.apply_guardrail(
+            inputs=_apply_inputs(AGENT_MESSAGES),
+            request_data={"model": "gpt-4o"},
+            input_type="request",
+            logging_obj=logging_obj,
+        )
+    assert not has_compresr_retrieve_tool(result.get("tools") or [])
+    assert guardrail._originals_by_call_id == {}
