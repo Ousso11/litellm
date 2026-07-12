@@ -955,9 +955,9 @@ class CompresrGuardrail(CustomGuardrail):
 
         contexts = [_content_to_text(messages[idx].get("content")) for idx in targets]
 
-        start_time = time.time()
+        start_time = time.monotonic()
         results = await self._call_compress(contexts=contexts, queries=queries)
-        end_time = time.time()
+        end_time = time.monotonic()
         if results is None:  # service failed, fail_open configured
             return inputs
 
